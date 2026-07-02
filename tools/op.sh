@@ -25,6 +25,7 @@ fi
 # =====================
 declare -A FORKS REPOS BRANCHES COMMENTS
 FORK_COUNT=0
+FORKS_CONF="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)/forks.conf"
 UNDECLARED_COUNT=0
 UNDECLARED_KEYS=()
 UNDECLARED_BRANCHES=()
@@ -40,7 +41,7 @@ function op_load_fork_config() {
     REPOS[$num]="${repo#*/}"
     BRANCHES[$num]="$branch"
     [[ -n "$comment" ]] && COMMENTS[$num]="$comment"
-    FORK_COUNT=$num
+    [ "$num" -gt "$FORK_COUNT" ] && FORK_COUNT=$num
   done < "$conf"
 }
 
@@ -63,8 +64,14 @@ function op_ensure_forks_dir() {
 
 function op_install() {
   echo "Installing op system-wide..."
-  CMD="\nalias op='"$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )/op.sh" \"\$@\"'\n"
-  grep "alias op=" "$RC_FILE" &> /dev/null || printf "$CMD" >> $RC_FILE
+  OP_SH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )/op.sh"
+  CMD=$(cat <<EOF
+alias op='$OP_SH "\$@"'
+_op_completions() { [ "\$COMP_CWORD" -eq 1 ] && COMPREPLY=(\$(compgen -W "\$(awk '/shift 1; op_/{print \$1}' $OP_SH)" -- "\${COMP_WORDS[1]}")); }
+[ -n "\$BASH_VERSION" ] && complete -F _op_completions -o default op
+EOF
+)
+  grep -q "alias op=" "$RC_FILE" 2>/dev/null || printf '\n%s\n' "$CMD" >> "$RC_FILE"
   echo -e " ↳ [${GREEN}✔${NC}] op installed successfully. Open a new shell to use it."
 }
 
@@ -464,7 +471,7 @@ function op_fork_ahead_behind() {
   GIT_TERMINAL_PROMPT=0 git fetch origin --quiet 2>/dev/null
   git rev-parse -q --verify "origin/$branch" >/dev/null 2>&1 || return
   local counts
-  counts=$(git rev-list --count --left-right "HEAD...origin/$branch" 2>/dev/null) || return
+  counts=$(git rev-list --count --left-right "refs/heads/$branch...origin/$branch" 2>/dev/null) || return
   local behind="${counts%%$'\t'*}"
   local ahead="${counts##*$'\t'}"
   [ -z "$behind" ] && behind=0
@@ -500,7 +507,7 @@ function op_info_fork() {
   echo "Title:    $(git log -1 --format='%s' 2>/dev/null || echo "N/A")"
   GIT_TERMINAL_PROMPT=0 git fetch origin --quiet 2>/dev/null
   local counts
-  counts=$(git rev-list --count --left-right "HEAD...origin/$branch" 2>/dev/null || true)
+  counts=$(git rev-list --count --left-right "refs/heads/$branch...origin/$branch" 2>/dev/null || true)
   if [ -n "$counts" ]; then
     local behind="${counts%%$'\t'*}"
     local ahead="${counts##*$'\t'}"
@@ -767,16 +774,108 @@ function op_use_fork() {
   fi
   op_run_command ln -sfn "$rp" /data/openpilot
   cd /data/openpilot || return
+  # Persist the target branch so the updater doesn't revert after reboot
+  local active_branch
+  active_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  if [ -n "$active_branch" ]; then
+    printf "%s" "$active_branch" > /data/params/d/UpdaterTargetBranch 2>/dev/null || true
+  fi
   if [ -f launch_env.sh ] && [ -f /VERSION ]; then
     local required installed
     required=$(grep -oP 'AGNOS_VERSION="\K[^"]+' launch_env.sh 2>/dev/null || true)
     installed=$(cat /VERSION 2>/dev/null || true)
     if [ -n "$required" ] && [ -n "$installed" ] && [ "$installed" != "$required" ]; then
       echo "[OS] Versions differ ($installed vs $required), running OS update..."
-      PYTHONPATH=$(pwd) ./system/hardware/tici/agnos.py system/hardware/tici/agnos.json --swap || true
+      # Prefer system venv which has required packages (e.g. pycryptodome) across AGNOS versions
+      local py
+      for py in /usr/local/venv/bin/python3 .venv/bin/python3 python3; do
+        "$py" -c "from Crypto.Hash import SHA512" 2>/dev/null && break
+        py=""
+      done
+      PYTHONPATH=$(pwd) "${py:-python3}" system/hardware/tici/agnos.py system/hardware/tici/agnos.json --swap || true
     fi
   fi
+  echo ""
+  echo -e "${BOLD}Note:${NC} after reboot you may need to run:"
+  echo "  op setup   — rebuild Python environment / install dependencies"
+  echo "  op build   — recompile openpilot for this fork"
+  echo ""
   op_run_command sudo reboot
+}
+
+function op_fork_from_url() {
+  # Parse: https://github.com/owner/repo[.git], git@github.com:owner/repo[.git],
+  #        owner/repo, or owner/repo:branch
+  local raw="$1" owner repo branch
+  raw="${raw%.git}"
+
+  # Extract branch suffix (owner/repo:branch — only for non-URL forms)
+  if [[ ! "$raw" =~ ^https?:// ]] && [[ ! "$raw" =~ ^git@ ]] && [[ "$raw" =~ ^([^:]+):([^:]+)$ ]]; then
+    branch="${BASH_REMATCH[2]}"
+    raw="${BASH_REMATCH[1]}"
+  fi
+
+  if   [[ "$raw" =~ ^https?://[^/]+/([^/]+)/([^/]+) ]]; then owner="${BASH_REMATCH[1]}"; repo="${BASH_REMATCH[2]}"
+  elif [[ "$raw" =~ ^git@[^:]+:([^/]+)/([^/]+) ]];       then owner="${BASH_REMATCH[1]}"; repo="${BASH_REMATCH[2]}"
+  elif [[ "$raw" =~ ^([^/]+)/([^/]+)$ ]];                 then owner="${BASH_REMATCH[1]}"; repo="${BASH_REMATCH[2]}"
+  else echo "Cannot parse fork URL: $1"; return 1
+  fi
+  [ -z "$branch" ] && branch="master"
+
+  # Check if already declared in forks.conf (exact owner+repo+branch match)
+  local n found_n=0 repo_known=0
+  for n in $(seq 1 $FORK_COUNT); do
+    if [ "${FORKS[$n]}" = "$owner" ] && [ "${REPOS[$n]}" = "$repo" ]; then
+      repo_known=1
+      if [ "${BRANCHES[$n]}" = "$branch" ]; then found_n=$n; break; fi
+    fi
+  done
+  if [ $found_n -gt 0 ]; then
+    echo "Already in forks.conf as entry #${found_n}: ${owner}/${repo} @ ${branch}"
+    op_use_fork $found_n
+    return
+  fi
+
+  # Unknown fork (or known repo, new branch) — propose saving
+  echo ""
+  if [ $repo_known -eq 1 ]; then
+    echo "  Known repo, new branch: ${owner}/${repo} @ ${branch}"
+    echo "  (Repo entry exists in forks.conf at a different branch — will fetch new branch on switch)"
+  else
+    echo "  Unknown fork: ${owner}/${repo} @ ${branch}"
+    echo "  Clone URL:    https://github.com/${owner}/${repo}.git"
+  fi
+  echo ""
+  read -p "Save to forks.conf as a new entry? [y/N] " save_ans
+  if [[ "$save_ans" =~ ^[yY] ]]; then
+    local new_n=$((FORK_COUNT + 1))
+    echo "${new_n} ${owner}/${repo} ${branch}" >> "$FORKS_CONF" || { echo "Failed to write to $FORKS_CONF"; return 1; }
+    echo "Saved as entry #${new_n}."
+    op_load_fork_config
+    op_use_fork $new_n
+  else
+    # Switch ad-hoc without saving
+    read -p "Switch to ${owner}/${repo} (${branch}) without saving? [y/N] " adhoc_ans
+    [[ "$adhoc_ans" =~ ^[yY] ]] || return
+    local rp="/data/${FORKS_DIR}/${owner}_${repo}"
+    mkdir -p "/data/${FORKS_DIR}"
+    if [ ! -d "$rp" ]; then
+      op_run_command git clone -b "$branch" --depth 1 --single-branch \
+        --recurse-submodules --shallow-submodules \
+        "https://github.com/${owner}/${repo}.git" "$rp"
+    else
+      op_run_command git -C "$rp" fetch origin "$branch:$branch" --depth 1
+    fi
+    op_scan_undeclared
+    local idx
+    for idx in $(seq 0 $((UNDECLARED_COUNT - 1))); do
+      if [ "${UNDECLARED_KEYS[$idx]}" = "${owner}_${repo}" ]; then
+        op_use_fork "U$((idx + 1))"
+        return
+      fi
+    done
+    echo "Clone complete at $rp. Run 'op fork' to switch."
+  fi
 }
 
 function op_fork() {
@@ -802,6 +901,7 @@ function op_fork() {
       echo "  list                    List all forks (no network)"
       echo "  status|check            List all forks with ahead/behind (fetches)"
       echo "  <N|UN>                  Switch to fork (clone + checkout + symlink + reboot)"
+      echo "  <URL|owner/repo[:branch]> Switch to any fork by URL or shorthand (propose save)"
       echo "  update <N|UN|all>       Update fork(s) (fetch + merge --ff-only)"
       echo "  info <N|UN>             Show SHA, date, title, ahead/behind"
       echo "  purge <N|UN>            Purge fork"
@@ -818,6 +918,8 @@ function op_fork() {
         echo "Invalid fork number. Use 1-$FORK_COUNT or U<N>."
       fi
       return ;;
+    https://*|git@*|*\/*)
+      op_fork_from_url "$1"; return ;;
     *)  [ -n "$1" ] && echo "Unknown action '$1'. Run 'op fork help' for usage." && return ;;
   esac
 
