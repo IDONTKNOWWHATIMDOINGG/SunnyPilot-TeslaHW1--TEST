@@ -28,6 +28,11 @@ LaneChangeDirection = log.LaneChangeDirection
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
+# Experimental basic-cruise following-distance protection.
+BASIC_CRUISE_MIN_TIME_GAP = 3.5  # seconds
+BASIC_CRUISE_UNSAFE_CONFIRMATION = 1.2  # seconds continuously below the target
+BASIC_CRUISE_MIN_SPEED = 5.0  # m/s (~11 mph); time-gap control is unreliable below this speed
+
 
 class Controls(ControlsExt):
   def __init__(self) -> None:
@@ -43,9 +48,12 @@ class Controls(ControlsExt):
 
     self.sm = messaging.SubMaster(['liveDelay', 'liveParameters', 'liveTorqueParameters', 'modelV2', 'selfdriveState',
                                    'liveCalibration', 'livePose', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'liveDelay'] + self.sm_services_ext,
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'radarState', 'liveDelay'] + self.sm_services_ext,
                                   poll='selfdriveState')
     self.pm = messaging.PubMaster(['carControl', 'controlsState'] + self.pm_services_ext)
+
+    self.basic_cruise_unsafe_frames = 0
+    self.basic_cruise_cancel_latched = False
 
     self.steer_limited_by_safety = False
     self.curvature = 0.0
@@ -171,7 +179,32 @@ class Controls(ControlsExt):
       CC.angularVelocity = self.calibrated_pose.angular_velocity.xyz.tolist()
 
     CC.cruiseControl.override = CC.enabled and not CC.longActive and (self.CP.openpilotLongitudinalControl or not self.CP_SP.pcmCruiseSpeed)
-    CC.cruiseControl.cancel = CS.cruiseState.enabled and (not CC.enabled or not self.CP.pcmCruise)
+
+    # On cars with basic (non-adaptive) cruise, cancel cruise when a detected lead
+    # remains closer than BASIC_CRUISE_MIN_TIME_GAP for the full confirmation time.
+    # This only requests the existing cruise-cancel action; it never commands
+    # acceleration or braking. The driver must manually resume cruise.
+    lead = self.sm['radarState'].leadOne
+    basic_cruise_active = CS.cruiseState.enabled and not self.CP.openpilotLongitudinalControl
+    valid_gap_measurement = lead.status and CS.vEgo >= BASIC_CRUISE_MIN_SPEED and lead.dRel > 0.0
+    following_time = lead.dRel / max(CS.vEgo, 0.1) if valid_gap_measurement else math.inf
+    unsafe_following_gap = basic_cruise_active and valid_gap_measurement and following_time < BASIC_CRUISE_MIN_TIME_GAP
+
+    if not basic_cruise_active:
+      self.basic_cruise_unsafe_frames = 0
+      self.basic_cruise_cancel_latched = False
+    elif unsafe_following_gap and not self.basic_cruise_cancel_latched:
+      self.basic_cruise_unsafe_frames += 1
+    else:
+      self.basic_cruise_unsafe_frames = 0
+
+    unsafe_confirmation_frames = round(BASIC_CRUISE_UNSAFE_CONFIRMATION / DT_CTRL)
+    basic_cruise_gap_cancel = self.basic_cruise_unsafe_frames >= unsafe_confirmation_frames
+    if basic_cruise_gap_cancel:
+      self.basic_cruise_cancel_latched = True
+
+    normal_cruise_cancel = CS.cruiseState.enabled and (not CC.enabled or not self.CP.pcmCruise)
+    CC.cruiseControl.cancel = normal_cruise_cancel or basic_cruise_gap_cancel
     CC.cruiseControl.resume = CC.enabled and CS.cruiseState.standstill and not self.sm['longitudinalPlan'].shouldStop
 
     hudControl = CC.hudControl
